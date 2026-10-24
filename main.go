@@ -9,127 +9,159 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 )
 
-type LSLRequest struct {
-	Text       string `json:"text"`
-	TargetLang string `json:"target_lang"`
-}
+const (
+	nativeLanguage       = "ES"    // idioma al que se traduce lo que dicen los demás
+	defaultOutgoingLang  = "EN-US" // si el script no manda ?lang=
+	maxIncomingBodyBytes = 4096    // el chat de SL es mucho más corto que esto
+)
 
-type DeepLRequest struct {
+var deepLClient = &http.Client{Timeout: 20 * time.Second}
+
+type deepLRequest struct {
 	Text       []string `json:"text"`
 	TargetLang string   `json:"target_lang"`
 }
 
-type DeepLResponse struct {
+type deepLResponse struct {
 	Translations []struct {
 		DetectedSourceLanguage string `json:"detected_source_language"`
 		Text                   string `json:"text"`
 	} `json:"translations"`
 }
 
-func callDeepL(text string, targetLang string, apiKey string) (*DeepLResponse, error) {
-	deepLPayload := DeepLRequest{
-		Text:       []string{text},
-		TargetLang: targetLang,
+// Las claves del plan Free terminan en ":fx" y van a api-free.deepl.com;
+// las de pago van a api.deepl.com. Si se mezclan, DeepL rechaza la petición.
+func deepLEndpoint(apiKey string) string {
+	if strings.HasSuffix(apiKey, ":fx") {
+		return "https://api-free.deepl.com/v2/translate"
+	}
+	return "https://api.deepl.com/v2/translate"
+}
+
+func translate(text, targetLang string) (translated, detectedLang string, err error) {
+	apiKey := strings.TrimSpace(os.Getenv("DEEPL_API_KEY"))
+	if apiKey == "" {
+		return "", "", fmt.Errorf("falta la variable de entorno DEEPL_API_KEY")
 	}
 
-	payloadBytes, _ := json.Marshal(deepLPayload)
-	req, err := http.NewRequest("POST", "https://api-free.deepl.com/v2/translate", bytes.NewBuffer(payloadBytes))
+	payload, err := json.Marshal(deepLRequest{Text: []string{text}, TargetLang: targetLang})
 	if err != nil {
-		return nil, err
+		return "", "", err
 	}
 
+	req, err := http.NewRequest(http.MethodPost, deepLEndpoint(apiKey), bytes.NewReader(payload))
+	if err != nil {
+		return "", "", err
+	}
 	req.Header.Set("Authorization", "DeepL-Auth-Key "+apiKey)
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil || resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("error HTTP en DeepL")
+	resp, err := deepLClient.Do(req)
+	if err != nil {
+		return "", "", fmt.Errorf("no se pudo contactar con DeepL: %w", err)
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
-	var deeplResp DeepLResponse
-	json.Unmarshal(body, &deeplResp)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", "", fmt.Errorf("error leyendo respuesta de DeepL: %w", err)
+	}
 
-	return &deeplResp, nil
+	// Antes este error se tragaba sin decir nada; ahora se ve el código y el motivo.
+	if resp.StatusCode != http.StatusOK {
+		return "", "", fmt.Errorf("DeepL respondió %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var parsed deepLResponse
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return "", "", fmt.Errorf("respuesta de DeepL ilegible: %w", err)
+	}
+	if len(parsed.Translations) == 0 {
+		return "", "", fmt.Errorf("DeepL no devolvió traducciones")
+	}
+
+	first := parsed.Translations[0]
+	return first.Text, strings.ToUpper(first.DetectedSourceLanguage), nil
 }
 
-// Maneja los mensajes ENTRANTES de otros avatares
-func translateInHandler(w http.ResponseWriter, r *http.Request) {
+// El script LSL manda el mensaje tal cual, en texto plano (sin JSON).
+func readChatText(w http.ResponseWriter, r *http.Request) (string, bool) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "Método no permitido", http.StatusMethodNotAllowed)
+		http.Error(w, "usa POST", http.StatusMethodNotAllowed)
+		return "", false
+	}
+
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxIncomingBodyBytes))
+	if err != nil {
+		http.Error(w, "cuerpo demasiado grande o ilegible", http.StatusBadRequest)
+		return "", false
+	}
+
+	text := strings.TrimSpace(string(raw))
+	if text == "" {
+		http.Error(w, "texto vacío", http.StatusBadRequest)
+		return "", false
+	}
+	return text, true
+}
+
+func writePlainText(w http.ResponseWriter, text string) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	io.WriteString(w, text)
+}
+
+// Mensajes ENTRANTES de otros avatares -> español.
+func translateInHandler(w http.ResponseWriter, r *http.Request) {
+	text, ok := readChatText(w, r)
+	if !ok {
 		return
 	}
 
-	var req LSLRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Text) == "" {
-		http.Error(w, "Petición inválida", http.StatusBadRequest)
+	translated, detected, err := translate(text, nativeLanguage)
+	if err != nil {
+		log.Printf("[in] %v", err)
+		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 
-	apiKey := os.Getenv("DEEPL_API_KEY")
-	if apiKey == "" {
-		http.Error(w, "Falta API Key", http.StatusInternalServerError)
-		return
-	}
-
-	// Idioma nativo fijo: Español (ES)
-	resp, err := callDeepL(req.Text, "ES", apiKey)
-	if err != nil || len(resp.Translations) == 0 {
-		http.Error(w, "Error al traducir", http.StatusInternalServerError)
-		return
-	}
-
-	detectedLang := resp.Translations[0].DetectedSourceLanguage
-
-	// Si el mensaje de origen YA ESTÁ en español, no devolvemos texto (204 No Content)
-	if detectedLang == "ES" {
+	// Ya estaba en español: no hay nada que mostrar.
+	if detected == nativeLanguage {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
-	// Devolver traducción indicando el idioma de origen
-	resultText := fmt.Sprintf("[%s]: %s", detectedLang, resp.Translations[0].Text)
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(resultText))
+	writePlainText(w, fmt.Sprintf("[%s] %s", detected, translated))
 }
 
-// Maneja tus mensajes SALIENTES enviando al chat público
+// Tus mensajes SALIENTES -> idioma indicado en ?lang=
 func translateOutHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Método no permitido", http.StatusMethodNotAllowed)
+	text, ok := readChatText(w, r)
+	if !ok {
 		return
 	}
 
-	var req LSLRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Text) == "" {
-		http.Error(w, "Petición inválida", http.StatusBadRequest)
+	targetLang := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("lang")))
+	if targetLang == "" {
+		targetLang = defaultOutgoingLang
+	}
+
+	translated, _, err := translate(text, targetLang)
+	if err != nil {
+		log.Printf("[out] %v", err)
+		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 
-	if req.TargetLang == "" {
-		req.TargetLang = "EN" // Idioma saliente por defecto: Inglés
-	}
+	writePlainText(w, translated)
+}
 
-	apiKey := os.Getenv("DEEPL_API_KEY")
-	if apiKey == "" {
-		http.Error(w, "Falta API Key", http.StatusInternalServerError)
-		return
-	}
-
-	resp, err := callDeepL(req.Text, req.TargetLang, apiKey)
-	if err != nil || len(resp.Translations) == 0 {
-		http.Error(w, "Error al traducir", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(resp.Translations[0].Text))
+// Ping ligero para despertar / mantener despierto el servicio en Render.
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	writePlainText(w, "ok")
 }
 
 func main() {
@@ -138,11 +170,14 @@ func main() {
 		port = "8080"
 	}
 
+	if os.Getenv("DEEPL_API_KEY") == "" {
+		log.Println("AVISO: DEEPL_API_KEY no está definida, todas las traducciones fallarán")
+	}
+
+	http.HandleFunc("/health", healthHandler)
 	http.HandleFunc("/translate-in", translateInHandler)
 	http.HandleFunc("/translate-out", translateOutHandler)
 
-	fmt.Printf("Servidor traductor escuchando en el puerto %s...\n", port)
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
-		log.Fatal(err)
-	}
+	log.Printf("Servidor traductor escuchando en el puerto %s...", port)
+	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
