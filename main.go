@@ -19,8 +19,10 @@ const (
 	nativeLanguage        = "ES"    // idioma al que se traduce lo que dicen los demás
 	defaultOutgoingLang   = "EN-US" // si el script no manda ?lang=
 	maxIncomingBodyBytes  = 4096    // el chat de SL es mucho más corto que esto
-	maxCacheEntries       = 500     // al llenarse, la caché se vacía entera (simple y barato)
-	maxCachedTextBytes    = 80      // solo se cachean frases cortas, que son las que se repiten
+	maxBatchBodyBytes     = 32768   // lote de mensajes entrantes (el script manda bastante menos)
+	maxBatchMessages      = 50
+	maxCacheEntries       = 500 // al llenarse, la caché se vacía entera (simple y barato)
+	maxCachedTextBytes    = 80  // solo se cachean frases cortas, que son las que se repiten
 	minLettersToTranslate = 2
 )
 
@@ -35,7 +37,84 @@ var (
 	fillerWordPattern = regexp.MustCompile(`^(?:(?:ha|he|hi|ja|je|ji|ah|eh)+h?|x+d+|l+o+l+|lmao+|rofl|o+k+|okay|k+|hm+|omg|brb|afk|ty|np)$`)
 
 	cache = translationCache{entries: make(map[string]cachedTranslation)}
+
+	// Palabras claramente españolas: con una basta como indicio.
+	strongSpanishWords = wordSet(`hola holi buenas buenos dias días tardes noches gracias adios adiós chao chau
+		estas estás estoy estamos bien muy mucho mucha muchos muchas quiero quieres tengo tienes puedo puedes
+		eres soy somos también tambien aquí aqui allí alli ahora hoy mañana ayer porque porqué dónde donde
+		cuándo cuando qué cómo quién quien vale claro bueno nada todo todos ustedes usted vosotros ella ellos
+		gusta gusto encanta amigo amiga amigos amigas guapa guapo linda lindo hermosa hermoso beso besos abrazo
+		abrazos jaja jajaja jeje oye mira vamos venga perdón perdon siempre nunca algo alguien gente cosa
+		bailar baila bailamos música musica canción cancion bienvenido bienvenida bienvenidos saludos feliz
+		cariño verdad entonces pues así asi eso esto ese esa este también sí pero muy`)
+
+	// Palabras cortas que también existen en portugués, italiano o francés:
+	// suman, pero por sí solas no deciden.
+	weakSpanishWords = wordSet(`como esta está que para por si el la lo los las del al un una unos unas y o
+		de en con sin me te se nos le les ya mi mis tu tú tus su sus es son yo él mas más menos no a`)
 )
+
+// Reduce a una las letras repetidas 3 o más veces seguidas ("holaaa" -> "hola").
+// "perro" o "llama" no cambian. (El regexp de Go no admite \1, por eso va a mano.)
+func collapseRepeatedLetters(word string) string {
+	runes := []rune(word)
+	var result []rune
+	for i := 0; i < len(runes); {
+		j := i
+		for j < len(runes) && runes[j] == runes[i] {
+			j++
+		}
+		if j-i >= 3 {
+			result = append(result, runes[i])
+		} else {
+			result = append(result, runes[i:j]...)
+		}
+		i = j
+	}
+	return string(result)
+}
+
+func wordSet(words string) map[string]bool {
+	set := make(map[string]bool)
+	for _, word := range strings.Fields(words) {
+		set[word] = true
+	}
+	return set
+}
+
+func splitWords(text string) []string {
+	return strings.FieldsFunc(strings.ToLower(text), func(r rune) bool { return !unicode.IsLetter(r) })
+}
+
+// Comprobación local, sin gastar cuota de DeepL. DeepL falla a menudo con
+// mensajes cortos (p. ej. "Hola" lo detectó como [ST]), así que primero se mira aquí.
+func looksSpanish(text string) bool {
+	if strings.ContainsAny(text, "¿¡ñÑ") {
+		return true
+	}
+
+	words := splitWords(text)
+	if len(words) == 0 {
+		return false
+	}
+
+	strongCount, spanishCount := 0, 0
+	for _, word := range words {
+		word = collapseRepeatedLetters(word)
+		if strongSpanishWords[word] {
+			strongCount++
+			spanishCount++
+		} else if weakSpanishWords[word] {
+			spanishCount++
+		}
+	}
+	return strongCount > 0 && spanishCount*100 >= len(words)*60
+}
+
+// Solo letras, en minúsculas: para comparar original y traducción.
+func lettersOnly(text string) string {
+	return strings.Join(splitWords(text), "")
+}
 
 // ---------- Tipos de DeepL ----------
 
@@ -132,35 +211,51 @@ func callDeepL(method, path string, payload []byte) ([]byte, error) {
 	return body, nil
 }
 
-func translate(text, targetLang string) (cachedTranslation, error) {
-	payload, err := json.Marshal(deepLTranslateRequest{Text: []string{text}, TargetLang: targetLang})
+// Varios textos en UNA sola llamada a DeepL. DeepL devuelve las
+// traducciones en el mismo orden en que se le mandan.
+func translateMany(texts []string, targetLang string) ([]cachedTranslation, error) {
+	payload, err := json.Marshal(deepLTranslateRequest{Text: texts, TargetLang: targetLang})
 	if err != nil {
-		return cachedTranslation{}, err
+		return nil, err
 	}
 
 	body, err := callDeepL(http.MethodPost, "/translate", payload)
 	if err != nil {
-		return cachedTranslation{}, err
+		return nil, err
 	}
 
 	var parsed deepLTranslateResponse
 	if err := json.Unmarshal(body, &parsed); err != nil {
-		return cachedTranslation{}, fmt.Errorf("respuesta de DeepL ilegible: %w", err)
+		return nil, fmt.Errorf("respuesta de DeepL ilegible: %w", err)
 	}
-	if len(parsed.Translations) == 0 {
-		return cachedTranslation{}, fmt.Errorf("DeepL no devolvió traducciones")
+	if len(parsed.Translations) != len(texts) {
+		return nil, fmt.Errorf("DeepL devolvió %d traducciones para %d textos", len(parsed.Translations), len(texts))
 	}
 
-	first := parsed.Translations[0]
-	return cachedTranslation{
-		text:         first.Text,
-		detectedLang: strings.ToUpper(first.DetectedSourceLanguage),
-	}, nil
+	results := make([]cachedTranslation, len(texts))
+	for i, translation := range parsed.Translations {
+		results[i] = cachedTranslation{
+			text:         translation.Text,
+			detectedLang: strings.ToUpper(translation.DetectedSourceLanguage),
+		}
+	}
+	return results, nil
+}
+
+func translate(text, targetLang string) (cachedTranslation, error) {
+	results, err := translateMany([]string{text}, targetLang)
+	if err != nil {
+		return cachedTranslation{}, err
+	}
+	return results[0], nil
+}
+
+func cacheKeyFor(text, targetLang string) (string, bool) {
+	return targetLang + "|" + strings.ToLower(text), len(text) <= maxCachedTextBytes
 }
 
 func translateWithCache(text, targetLang string) (cachedTranslation, error) {
-	cacheable := len(text) <= maxCachedTextBytes
-	cacheKey := targetLang + "|" + strings.ToLower(text)
+	cacheKey, cacheable := cacheKeyFor(text, targetLang)
 
 	if cacheable {
 		if entry, found := cache.get(cacheKey); found {
@@ -183,7 +278,7 @@ func removeLinks(text string) string {
 
 // false si el mensaje no tiene letras suficientes o solo son risas/abreviaturas.
 func needsTranslation(text string) bool {
-	words := strings.FieldsFunc(strings.ToLower(text), func(r rune) bool { return !unicode.IsLetter(r) })
+	words := splitWords(text)
 
 	letterCount := 0
 	onlyFiller := true
@@ -225,37 +320,116 @@ func writePlainText(w http.ResponseWriter, text string) {
 	io.WriteString(w, text)
 }
 
-// Mensajes ENTRANTES de otros avatares -> español.
-// Respuestas para el script:
-//
-//	200 con texto -> traducción
-//	200 vacío     -> descartado sin llamar a DeepL (risas, enlaces, sin letras)
-//	204           -> estaba en español (el script recuerda a ese hablante)
+// Errores nuestros (DeepL falló, cuota agotada...) se devuelven como 424 y no
+// como 5xx: SL bloquea un script que recibe 5 errores 500+ en 60 segundos.
+const statusTranslationFailed = http.StatusFailedDependency
+
+// Limpia un mensaje entrante. Devuelve "" si no merece llamar a DeepL
+// (risas, enlaces, sin letras o español reconocido localmente).
+func prepareIncoming(text string) string {
+	text = removeLinks(strings.TrimSpace(text))
+	if !needsTranslation(text) || looksSpanish(text) {
+		return ""
+	}
+	return text
+}
+
+// Línea a mostrar al dueño, o "" si no hay nada que mostrar porque ya era
+// español o la "traducción" sale igual que el original (DeepL se equivocó de idioma).
+func formatIncoming(original string, result cachedTranslation) string {
+	if result.detectedLang == nativeLanguage || lettersOnly(result.text) == lettersOnly(original) {
+		return ""
+	}
+	line := fmt.Sprintf("[%s] %s", result.detectedLang, result.text)
+	return strings.ReplaceAll(line, "\n", " ") // una línea por mensaje (formato del lote)
+}
+
+// Mensajes ENTRANTES de uno en uno (lo usan los HUD con el script antiguo).
+// 200 con texto -> traducción; 200 vacío o 204 -> no mostrar nada.
 func translateInHandler(w http.ResponseWriter, r *http.Request) {
 	text, ok := readChatText(w, r)
 	if !ok {
 		return
 	}
 
-	text = removeLinks(text)
-	if !needsTranslation(text) {
-		w.WriteHeader(http.StatusOK)
+	text = prepareIncoming(text)
+	if text == "" {
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
 	result, err := translateWithCache(text, nativeLanguage)
 	if err != nil {
 		log.Printf("[in] %v", err)
-		http.Error(w, err.Error(), http.StatusBadGateway)
+		http.Error(w, err.Error(), statusTranslationFailed)
 		return
 	}
 
-	if result.detectedLang == nativeLanguage {
+	line := formatIncoming(text, result)
+	if line == "" {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+	writePlainText(w, line)
+}
 
-	writePlainText(w, fmt.Sprintf("[%s] %s", result.detectedLang, result.text))
+// Mensajes ENTRANTES en lote: una línea por mensaje en la petición y una
+// línea por mensaje en la respuesta, en el mismo orden (vacía = no mostrar).
+// Todo lo que haga falta traducir va en UNA sola llamada a DeepL.
+func translateBatchHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "usa POST", http.StatusMethodNotAllowed)
+		return
+	}
+
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBatchBodyBytes))
+	if err != nil {
+		http.Error(w, "lote demasiado grande o ilegible", http.StatusBadRequest)
+		return
+	}
+
+	lines := strings.Split(string(raw), "\n")
+	if len(lines) > maxBatchMessages {
+		http.Error(w, "demasiados mensajes en el lote", http.StatusBadRequest)
+		return
+	}
+
+	output := make([]string, len(lines))
+	var pendingIndexes []int
+	var pendingTexts []string
+
+	for i, line := range lines {
+		text := prepareIncoming(line)
+		if text == "" {
+			continue
+		}
+		cacheKey, cacheable := cacheKeyFor(text, nativeLanguage)
+		if cacheable {
+			if entry, found := cache.get(cacheKey); found {
+				output[i] = formatIncoming(text, entry)
+				continue
+			}
+		}
+		pendingIndexes = append(pendingIndexes, i)
+		pendingTexts = append(pendingTexts, text)
+	}
+
+	if len(pendingTexts) > 0 {
+		results, err := translateMany(pendingTexts, nativeLanguage)
+		if err != nil {
+			log.Printf("[batch] %v", err)
+			http.Error(w, err.Error(), statusTranslationFailed)
+			return
+		}
+		for n, index := range pendingIndexes {
+			if cacheKey, cacheable := cacheKeyFor(pendingTexts[n], nativeLanguage); cacheable {
+				cache.put(cacheKey, results[n])
+			}
+			output[index] = formatIncoming(pendingTexts[n], results[n])
+		}
+	}
+
+	writePlainText(w, strings.Join(output, "\n"))
 }
 
 // Tus mensajes SALIENTES -> idioma indicado en ?lang=
@@ -273,7 +447,7 @@ func translateOutHandler(w http.ResponseWriter, r *http.Request) {
 	result, err := translateWithCache(text, targetLang)
 	if err != nil {
 		log.Printf("[out] %v", err)
-		http.Error(w, err.Error(), http.StatusBadGateway)
+		http.Error(w, err.Error(), statusTranslationFailed)
 		return
 	}
 
@@ -285,13 +459,13 @@ func usageHandler(w http.ResponseWriter, r *http.Request) {
 	body, err := callDeepL(http.MethodGet, "/usage", nil)
 	if err != nil {
 		log.Printf("[usage] %v", err)
-		http.Error(w, err.Error(), http.StatusBadGateway)
+		http.Error(w, err.Error(), statusTranslationFailed)
 		return
 	}
 
 	var usage deepLUsageResponse
 	if err := json.Unmarshal(body, &usage); err != nil {
-		http.Error(w, "respuesta de uso ilegible", http.StatusBadGateway)
+		http.Error(w, "respuesta de uso ilegible", statusTranslationFailed)
 		return
 	}
 
@@ -321,6 +495,7 @@ func main() {
 	http.HandleFunc("/health", healthHandler)
 	http.HandleFunc("/usage", usageHandler)
 	http.HandleFunc("/translate-in", translateInHandler)
+	http.HandleFunc("/translate-batch", translateBatchHandler)
 	http.HandleFunc("/translate-out", translateOutHandler)
 
 	log.Printf("Servidor traductor escuchando en el puerto %s...", port)
